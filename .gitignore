@@ -1,0 +1,29 @@
+# 비밀값 파일 (실제 값 포함)
+monitoring/05a-grafana-secret.yaml
+*-secret.yaml
+secrets/
+
+# SSH 키 / 인증서
+*.pem
+*.key
+id_rsa
+id_ed25519
+*.crt
+
+# k3s 관련
+node-token
+kubeconfig
+*.kubeconfig
+
+# 로그 / 임시 / 백업
+*.log
+*.tmp
+*.bak
+*~
+*.swp
+*.yaml.bak
+*.yml.bak
+
+# OS
+.DS_Store
+Thumbs.db
