@@ -1,0 +1,251 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: monitoring
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+  - apiGroups: [""]
+    resources:
+      - nodes
+      - nodes/proxy
+      - services
+      - endpoints
+      - pods
+    verbs: [get, list, watch]
+  - nonResourceURLs: ["/metrics"]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: monitoring
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 30s
+      evaluation_interval: 30s
+      external_labels:
+        cluster: company-k3s
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets:
+                - alertmanager.monitoring.svc.cluster.local:9093
+
+    rule_files:
+      - /etc/prometheus/rules/*.yml
+
+    scrape_configs:
+      # Prometheus 자기 자신
+      - job_name: prometheus
+        static_configs:
+          - targets: ['localhost:9090']
+
+      # node-exporter (DaemonSet으로 뜬 Pod 자동 발견)
+      - job_name: node-exporter
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [monitoring]
+        relabel_configs:
+          # app=node-exporter 라벨이 붙은 Pod만 수집
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: node-exporter
+
+          # instance = 노드 이름
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: instance
+
+          # node = 노드 이름
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+
+          # targetHost = node-exporter Pod가 떠 있는 노드의 IP
+          - source_labels: [__meta_kubernetes_pod_host_ip]
+            target_label: targetHost
+
+      # kube-state-metrics
+      - job_name: kube-state-metrics
+        static_configs:
+          - targets:
+              - kube-state-metrics.monitoring.svc.cluster.local:8080
+
+  rules.yml: |
+    groups:
+      - name: node-health
+        rules:
+          - alert: NodeDown
+            expr: up{job=~"node-exporter"} == 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Node {{ $labels.instance }} is down"
+              description: "Target {{ $labels.instance }} has been unreachable for >1m"
+
+          - alert: HighCpuLoad
+            expr: avg by (instance) (rate(node_cpu_seconds_total{mode!="idle"}[5m])) > 0.7
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "High CPU on {{ $labels.instance }}"
+              description: "Average CPU usage above 70% for >5m"
+
+          - alert: HighMemoryUsage
+            expr: 1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes) > 0.85
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "High memory on {{ $labels.instance }}"
+              description: "Memory usage above 85% for >5m"
+
+          - alert: DiskAlmostFull
+            expr: 1 - (node_filesystem_avail_bytes{fstype!~"tmpfs|overlay"} / node_filesystem_size_bytes{fstype!~"tmpfs|overlay"}) > 0.15
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Disk almost full on {{ $labels.instance }} ({{ $labels.mountpoint }})"
+              description: "Target host {{ $labels.targetHost }} filesystem usage above 15% for >1m"
+
+      - name: k8s-workload
+        rules:
+          - alert: PodCrashLooping
+            expr: increase(kube_pod_container_status_restarts_total[5m]) > 3
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Pod {{ $labels.namespace }}/{{ $labels.pod }} crash-looping"
+              description: "Container {{ $labels.container }} restarted >3 times in 5m"
+
+          - alert: DeploymentReplicasMismatch
+            expr: kube_deployment_status_replicas_available < kube_deployment_spec_replicas
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Deployment {{ $labels.namespace }}/{{ $labels.deployment }} has unavailable replicas"
+              description: "Available < Desired for >5m"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-data
+  namespace: monitoring
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      nodeSelector:
+        role: monitoring
+      securityContext:
+        fsGroup: 65534
+        runAsUser: 65534
+        runAsNonRoot: true
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.54.1
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=15d
+            - --web.enable-lifecycle
+            - --web.console.libraries=/usr/share/prometheus/console_libraries
+            - --web.console.templates=/usr/share/prometheus/consoles
+          ports:
+            - name: http
+              containerPort: 9090
+          resources:
+            requests:
+              cpu: 200m
+              memory: 400Mi
+            limits:
+              cpu: 1000m
+              memory: 2Gi
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: 9090
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus/prometheus.yml
+              subPath: prometheus.yml
+            - name: config
+              mountPath: /etc/prometheus/rules/rules.yml
+              subPath: rules.yml
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: prometheus-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app: prometheus
+spec:
+  type: NodePort
+  selector:
+    app: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: 9090
+      nodePort: 30090
